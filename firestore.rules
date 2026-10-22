@@ -1,0 +1,68 @@
+// STARTER rules — review before deploying. Client-side checks in the app are UX only.
+// Anything marked CLOUD FUNCTION must be done server-side (bookings, payments, notifications, role changes).
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isAdmin()  { return signedIn() && request.auth.token.role == 'admin'; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Public: categories + service fee are needed before login.
+    match /settings/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      // Owner may edit profile fields only — NOT role / status / hostApplication.status (CLOUD FUNCTION / admin).
+      allow create: if isOwner(uid) && request.resource.data.role == 'guest';
+      allow update: if isAdmin() ||
+        (isOwner(uid) && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['role','status','email']));
+      match /wishlist/{listingId} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    match /listings/{id} {
+      allow read: if resource.data.status == 'published'
+                  || isOwner(resource.data.hostId) || isAdmin();
+      allow create: if signedIn() && request.auth.token.role == 'host'
+                    && request.resource.data.hostId == request.auth.uid
+                    && request.resource.data.status == 'pending';
+      allow update: if isAdmin() || (isOwner(resource.data.hostId)
+                    && request.resource.data.hostId == resource.data.hostId);
+      allow delete: if isAdmin() || isOwner(resource.data.hostId); // + "no active bookings" check => CLOUD FUNCTION
+    }
+
+    // CLOUD FUNCTION writes: price calc, double-booking transaction, status transitions, refunds.
+    match /bookings/{id} {
+      allow read: if signedIn() && (resource.data.guestId == request.auth.uid
+                  || resource.data.hostId == request.auth.uid || isAdmin());
+      allow write: if false;
+    }
+    // Availability for the booking widget: expose only {listingId, checkIn, checkOut} via a Function or a
+    // separate public 'availability' collection — guests must not read other people's bookings.
+
+    match /payments/{id} {
+      allow read: if signedIn() && (resource.data.guestId == request.auth.uid
+                  || resource.data.hostId == request.auth.uid || isAdmin());
+      allow write: if false; // Stripe webhook only
+    }
+
+    match /reviews/{id} {
+      allow read: if resource.data.status == 'visible'
+                  || isOwner(resource.data.guestId) || isAdmin();
+      allow create: if signedIn() && request.resource.data.guestId == request.auth.uid; // eligibility => CLOUD FUNCTION
+      allow update, delete: if isAdmin();
+    }
+
+    match /notifications/{id} {
+      allow read, delete: if signedIn() && resource.data.userId == request.auth.uid;
+      allow update: if signedIn() && resource.data.userId == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow create: if false; // CLOUD FUNCTION
+    }
+  }
+}
