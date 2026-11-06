@@ -1,77 +1,165 @@
-// FIREBASE: Firestore collection 'notifications' { userId, type, title, message, link, read, createdAt }
-//   notify*    -> addDoc from a Cloud Function (triggered by booking / listing changes)
-//   getNotifications -> onSnapshot(query(collection(db,'notifications'), where('userId','==',uid), orderBy('createdAt','desc')))
-import { getDb, save, delay, genId, clone } from "./db.js";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+  writeBatch,
+} from "firebase/firestore";
+import { auth, db } from "../firebase.js";
 
-// Internal helper used by other services. Synchronous so it can run inside their transactions.
-export function pushNotification(
-  userId,
-  { type = "info", title, message, link = "" },
-) {
-  if (!userId) return;
-  getDb().notifications.unshift({
-    id: genId("n"),
-    userId,
+const notificationsRef = collection(db, "notifications");
+
+const requireOwnUser = (userId) => {
+  if (!auth.currentUser || auth.currentUser.uid !== userId)
+    throw new Error("You can only access your own notifications.");
+};
+
+const requireAdmin = async () => {
+  const user = auth.currentUser;
+  if (!user) throw new Error("Administrator access required.");
+  const userSnapshot = await getDoc(doc(db, "users", user.uid));
+  if (!userSnapshot.exists() || userSnapshot.data().role !== "admin")
+    throw new Error(
+      "Only administrators can create notifications directly. Event notifications require a trusted backend.",
+    );
+  return user;
+};
+
+const toNotification = (snapshot) => {
+  const data = snapshot.data();
+  return {
+    id: snapshot.id,
+    ...data,
+    createdAt: data.createdAt?.toDate
+      ? data.createdAt.toDate().toISOString()
+      : data.createdAt,
+  };
+};
+
+const notificationData = ({ type = "info", title, message, link = "" }) => {
+  if (typeof title !== "string" || typeof message !== "string")
+    throw new Error("A notification requires a title and message.");
+  return {
     type,
     title,
     message,
     link,
     read: false,
-    createdAt: new Date().toISOString(),
-  });
-  save();
-}
-
-export const notifyAdmins = (payload) =>
-  getDb()
-    .users.filter((u) => u.role === "admin")
-    .forEach((a) => pushNotification(a.id, { type: "admin", ...payload }));
-
-export async function getNotifications(userId) {
-  await delay(80);
-  return clone(
-    getDb()
-      .notifications.filter((n) => n.userId === userId)
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
-  );
-}
-
-export async function getUnreadCount(userId) {
-  return getDb().notifications.filter((n) => n.userId === userId && !n.read)
-    .length;
-}
-
-// Live feed for the bell. cb({ count, items }) fires immediately and on every change; returns an unsubscribe fn.
-// FIREBASE: onSnapshot(query(collection(db,'notifications'), where('userId','==',userId), orderBy('createdAt','desc'), limit(50)),
-//   (snap) => { const items = snap.docs.map(d => ({ id: d.id, ...d.data() })); cb({ count: items.filter(n => !n.read).length, items }); })
-//   and return that onSnapshot's unsubscribe.
-export function subscribeNotifications(userId, cb) {
-  const push = async () => {
-    const items = await getNotifications(userId);
-    cb({ count: items.filter((n) => !n.read).length, items });
+    createdAt: serverTimestamp(),
   };
-  push();
-  const t = setInterval(push, 4000); // local demo polling only
-  return () => clearInterval(t);
+};
+
+export async function pushNotification(userId, payload) {
+  if (!userId) throw new Error("A notification recipient is required.");
+  await requireAdmin();
+  const ref = await addDoc(notificationsRef, {
+    userId,
+    ...notificationData(payload),
+  });
+  return ref.id;
 }
 
-export async function markRead(id) {
-  const n = getDb().notifications.find((x) => x.id === id);
-  if (n) {
-    n.read = true;
-    save();
+export async function notifyAdmins(payload) {
+  await requireAdmin();
+  const admins = await getDocs(
+    query(collection(db, "users"), where("role", "==", "admin")),
+  );
+  const recipients = admins.docs.map((snapshot) => snapshot.id);
+  const data = notificationData({ type: "admin", ...payload });
+
+  for (let index = 0; index < recipients.length; index += 500) {
+    const batch = writeBatch(db);
+    recipients.slice(index, index + 500).forEach((userId) => {
+      batch.set(doc(notificationsRef), { userId, ...data });
+    });
+    await batch.commit();
   }
 }
 
+export async function getNotifications(userId) {
+  requireOwnUser(userId);
+  const snapshot = await getDocs(
+    query(
+      notificationsRef,
+      where("userId", "==", userId),
+      orderBy("createdAt", "desc"),
+    ),
+  );
+  return snapshot.docs.map(toNotification);
+}
+
+export async function getUnreadCount(userId) {
+  requireOwnUser(userId);
+  const snapshot = await getDocs(
+    query(
+      notificationsRef,
+      where("userId", "==", userId),
+      where("read", "==", false),
+    ),
+  );
+  return snapshot.size;
+}
+
+export function subscribeNotifications(userId, callback) {
+  requireOwnUser(userId);
+  if (typeof callback !== "function")
+    throw new Error("A notification callback is required.");
+
+  return onSnapshot(
+    query(
+      notificationsRef,
+      where("userId", "==", userId),
+      orderBy("createdAt", "desc"),
+      limit(50),
+    ),
+    (snapshot) => {
+      const items = snapshot.docs.map(toNotification);
+      callback({
+        count: items.filter((notification) => !notification.read).length,
+        items,
+      });
+    },
+    (error) => {
+      console.error("Failed to subscribe to notifications:", error);
+    },
+  );
+}
+
+export async function markRead(id) {
+  if (!id) throw new Error("A notification ID is required.");
+  await updateDoc(doc(db, "notifications", id), { read: true });
+}
+
 export async function markAllRead(userId) {
-  getDb().notifications.forEach((n) => {
-    if (n.userId === userId) n.read = true;
-  });
-  save();
+  requireOwnUser(userId);
+  const snapshot = await getDocs(
+    query(
+      notificationsRef,
+      where("userId", "==", userId),
+      where("read", "==", false),
+    ),
+  );
+  const unread = snapshot.docs;
+
+  for (let index = 0; index < unread.length; index += 500) {
+    const batch = writeBatch(db);
+    unread.slice(index, index + 500).forEach((notification) => {
+      batch.update(notification.ref, { read: true });
+    });
+    await batch.commit();
+  }
 }
 
 export async function deleteNotification(id) {
-  const db = getDb();
-  db.notifications = db.notifications.filter((n) => n.id !== id);
-  save();
+  if (!id) throw new Error("A notification ID is required.");
+  await deleteDoc(doc(db, "notifications", id));
 }

@@ -4,7 +4,6 @@
 //   signOut -> signOut(auth)
 //   session -> onAuthStateChanged(auth, cb)   (see AuthContext.jsx)
 import { getDb, save, delay, genId, clone } from "./db.js";
-import { notifyAdmins, pushNotification } from "./notificationService.js";
 import {
   createUserWithEmailAndPassword,
   updateProfile as updateAuthProfile,
@@ -150,6 +149,12 @@ export async function signUp({ name, email, password, role = "guest" }) {
     console.log("User data:", userData);
     try {
       await setDoc(doc(db, "users", user.uid), userData);
+      await setDoc(doc(db, "publicProfiles", user.uid), {
+        name: normalizedName,
+        avatar,
+        bio: "",
+        createdAt: serverTimestamp(),
+      });
       console.log("Firestore write successful!");
     } catch (error) {
       console.error("Firestore write failed!");
@@ -216,6 +221,17 @@ export async function updateProfile(userId, data) {
   }
 
   await updateDoc(userRef, updates);
+
+  await setDoc(
+    doc(db, "publicProfiles", userId),
+    {
+      name: name ?? userSnap.data().name ?? "",
+      avatar: avatar ?? userSnap.data().avatar ?? "",
+      bio: bio ?? userSnap.data().bio ?? "",
+      createdAt: userSnap.data().createdAt ?? serverTimestamp(),
+    },
+    { merge: true },
+  );
 
   return await getUser(userId);
 }

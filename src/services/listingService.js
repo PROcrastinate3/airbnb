@@ -126,9 +126,9 @@ export async function getListing(id) {
   if (!listingSnap.exists()) return null;
   const listing = { id: listingSnap.id, ...listingSnap.data() };
 
-  // Fetch the host and the listing's reviews in parallel
-  const [hostSnap, reviewsSnap] = await Promise.all([
-    listing.hostId ? getDoc(doc(db, "users", listing.hostId)) : null,
+  // Public profile documents are readable by guests; user documents are private.
+  const [profiles, reviewsSnap] = await Promise.all([
+    getPublicProfiles(listing.hostId ? [listing.hostId] : []),
     getDocs(
       query(
         collection(db, "reviews"),
@@ -138,10 +138,7 @@ export async function getListing(id) {
     ),
   ]);
 
-  const host =
-    hostSnap && hostSnap.exists()
-      ? { id: hostSnap.id, ...hostSnap.data() }
-      : null;
+  const host = profiles.get(listing.hostId);
 
   // Visibility and sorting are done client-side (no composite index needed)
   const visibleReviews = reviewsSnap.docs
@@ -149,18 +146,11 @@ export async function getListing(id) {
     .filter(isVisible)
     .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
 
-  // Fetch each unique guest once, not once per review
+  // Reviewer profiles are public; do not read private user documents here.
   const guestIds = [
     ...new Set(visibleReviews.map((r) => r.guestId).filter(Boolean)),
   ];
-  const guestSnaps = await Promise.all(
-    guestIds.map((gid) => getDoc(doc(db, "users", gid))),
-  );
-  const guestsById = new Map(
-    guestSnaps
-      .filter((s) => s.exists())
-      .map((s) => [s.id, { id: s.id, ...s.data() }]),
-  );
+  const guestsById = await getPublicProfiles(guestIds);
 
   const reviews = visibleReviews.map((r) => ({
     ...r,
@@ -459,8 +449,19 @@ async function getPublicProfiles(ids) {
       try {
         const snap = await getDoc(doc(db, "publicProfiles", uid));
         if (!snap.exists()) return null;
-        const { name, avatar } = snap.data();
-        return [uid, { id: uid, name, avatar }];
+        const { name, avatar, bio, createdAt } = snap.data();
+        return [
+          uid,
+          {
+            id: uid,
+            name,
+            avatar,
+            bio,
+            createdAt: createdAt?.toDate
+              ? createdAt.toDate().toISOString()
+              : createdAt ?? null,
+          },
+        ];
       } catch {
         return null;
       }

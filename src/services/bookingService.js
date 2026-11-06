@@ -1,22 +1,36 @@
-// FIREBASE: Firestore collection 'bookings'
-//   createBooking -> addDoc(collection(db,'bookings'), {...})   (do this in a Cloud Function
-//                    in production so prices are computed server-side, not trusted from the client)
-//   queries       -> query(collection(db,'bookings'), where('guestId','==',uid))
-//   updateBookingStatus -> Cloud Function that re-checks who is allowed to make each change
-import { getDb, save, delay, genId, clone } from "./db.js";
+// Booking data is stored in Firestore. Public availability uses date-only lock documents
+// so guests never need access to other guests' booking documents.
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  runTransaction,
+  where,
+} from "firebase/firestore";
+import { auth, db } from "../firebase.js";
 import { getServiceFeeRate } from "./settingsService.js";
-import { pushNotification } from "./notificationService.js";
 import {
   ACTIVE_STATUSES,
+  addDays,
   blockedToRanges,
-  isRangeFree,
+  rangesOverlap,
   refundFor,
   todayStr,
-  unavailableRanges,
   withListingDefaults,
 } from "./rules.js";
 
 export { CANCELLATION_POLICIES, refundFor } from "./rules.js";
+
+const asISO = (value) =>
+  value?.toDate ? value.toDate().toISOString() : value;
+
+const normalizeBooking = (booking) => ({
+  ...booking,
+  createdAt: asISO(booking.createdAt),
+  cancelledAt: asISO(booking.cancelledAt),
+});
 
 export function nightsBetween(checkIn, checkOut) {
   if (!checkIn || !checkOut) return 0;
@@ -37,26 +51,62 @@ export function calculatePricing(listing, nights) {
 
 // Booked ranges + dates the host blocked manually. Used by the booking widget and search.
 export async function getUnavailableRanges(listingId) {
-  await delay(80);
-  return unavailableRanges(getDb(), listingId);
+  const [listingSnap, lockSnapshot] = await Promise.all([
+    getDoc(doc(db, "listings", listingId)),
+    getDocs(collection(db, "listings", listingId, "availability")),
+  ]);
+  if (!listingSnap.exists()) throw new Error("Listing not found.");
+  const bookedRanges = lockSnapshot.docs.map((lock) => {
+    const date = lock.data().date || lock.id;
+    return { checkIn: date, checkOut: addDays(date, 1) };
+  });
+  return [
+    ...bookedRanges,
+    ...blockedToRanges(listingSnap.data().blockedDates),
+  ];
 }
 
 export async function isAvailable(listingId, checkIn, checkOut) {
-  await delay(40);
-  return isRangeFree(getDb(), listingId, checkIn, checkOut);
+  const ranges = await getUnavailableRanges(listingId);
+  return !ranges.some((range) =>
+    rangesOverlap(checkIn, checkOut, range.checkIn, range.checkOut),
+  );
 }
 
-const enrich = (b) => {
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === b.listingId);
-  const guest = db.users.find((u) => u.id === b.guestId);
-  const host = db.users.find((u) => u.id === b.hostId);
-  const payment = db.payments.find((p) => p.id === b.paymentId);
+const enrich = async (booking) => {
+  const b = normalizeBooking(booking);
+  const [listingSnap, paymentSnap] = await Promise.all([
+    b.listingSnapshot || !b.listingId
+      ? null
+      : getDoc(doc(db, "listings", b.listingId)),
+    b.paymentId ? getDoc(doc(db, "payments", b.paymentId)) : null,
+  ]);
+  const listing =
+    b.listingSnapshot ??
+    (listingSnap?.exists()
+      ? { id: listingSnap.id, ...listingSnap.data() }
+      : null);
+  const guest =
+    b.guestSnapshot ??
+    (b.guestName
+      ? {
+          id: b.guestId,
+          name: b.guestName,
+          avatar: b.guestAvatar,
+          email: b.guestEmail,
+          phone: b.guestPhone,
+          createdAt: asISO(b.guestCreatedAt),
+        }
+      : null);
+  const host =
+    b.hostSnapshot ??
+    (b.hostName ? { id: b.hostId, name: b.hostName } : null);
+  const payment = paymentSnap?.exists() ? paymentSnap.data() : null;
   return {
     ...b,
     listing: listing
       ? {
-          id: listing.id,
+          id: listing.id || b.listingId,
           title: listing.title,
           location: listing.location,
           images: listing.images,
@@ -84,15 +134,15 @@ const enrich = (b) => {
       : null,
     guest: guest
       ? {
-          id: guest.id,
+          id: guest.id || b.guestId,
           name: guest.name,
           avatar: guest.avatar,
           email: guest.email,
           phone: guest.phone,
-          createdAt: guest.createdAt,
+          createdAt: guest.createdAt ? asISO(guest.createdAt) : null,
         }
       : null,
-    host: host ? { id: host.id, name: host.name } : null,
+    host: host ? { id: host.id || b.hostId, name: host.name } : null,
     payment: payment
       ? {
           status: payment.status,
@@ -111,77 +161,122 @@ export async function createBooking({
   checkOut,
   guests,
 }) {
-  await delay();
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === listingId);
-  if (!listing || listing.status !== "published")
-    throw new Error("This listing is not available for booking.");
-  if (listing.hostId === guestId)
-    throw new Error("You cannot book your own listing.");
+  if (!auth.currentUser || auth.currentUser.uid !== guestId)
+    throw new Error("You must be logged in to book this stay.");
   const nights = nightsBetween(checkIn, checkOut);
   if (nights < 1) throw new Error("Please choose valid dates.");
   if (checkIn < todayStr()) throw new Error("Check-in cannot be in the past.");
-  if (!guests || guests < 1) throw new Error("Add at least one guest.");
-  if (guests > listing.maxGuests)
-    throw new Error(`This place allows up to ${listing.maxGuests} guests.`);
-  // double-booking prevention: re-checked here even though the UI also blocks these dates
-  if (!isRangeFree(db, listingId, checkIn, checkOut))
-    throw new Error("Those dates are no longer available.");
-  const pricing = calculatePricing(listing, nights);
-  const booking = {
-    id: genId("b"),
-    listingId,
-    guestId,
-    hostId: listing.hostId,
-    checkIn,
-    checkOut,
-    guests,
-    nights,
-    ...pricing,
-    status: "pending_payment",
-    createdAt: new Date().toISOString(),
-    paymentId: null,
-  };
-  db.bookings.unshift(booking);
-  save();
-  return clone(booking);
+  if (!Number.isInteger(guests) || guests < 1)
+    throw new Error("Add at least one guest.");
+
+  const listingRef = doc(db, "listings", listingId);
+  const bookingRef = doc(collection(db, "bookings"));
+  const dates = Array.from({ length: nights }, (_, index) =>
+    addDays(checkIn, index),
+  );
+  const lockRefs = dates.map((date) =>
+    doc(db, "listings", listingId, "availability", date),
+  );
+  const guestSnap = await getDoc(doc(db, "users", guestId));
+  const guest = guestSnap.exists() ? guestSnap.data() : {};
+
+  return runTransaction(db, async (transaction) => {
+    const [listingSnap, ...lockSnaps] = await Promise.all([
+      transaction.get(listingRef),
+      ...lockRefs.map((ref) => transaction.get(ref)),
+    ]);
+    if (!listingSnap.exists() || listingSnap.data().status !== "published")
+      throw new Error("This listing is not available for booking.");
+    const listing = withListingDefaults({
+      id: listingSnap.id,
+      ...listingSnap.data(),
+    });
+    if (listing.hostId === guestId)
+      throw new Error("You cannot book your own listing.");
+    if (!Number.isFinite(listing.maxGuests) || guests > listing.maxGuests)
+      throw new Error(`This place allows up to ${listing.maxGuests} guests.`);
+    if (dates.some((date) => listing.blockedDates.includes(date)))
+      throw new Error("Those dates are no longer available.");
+    if (lockSnaps.some((lock) => lock.exists()))
+      throw new Error("Those dates are no longer available.");
+
+    const booking = {
+      listingId,
+      guestId,
+      hostId: listing.hostId,
+      checkIn,
+      checkOut,
+      guests,
+      nights,
+      ...calculatePricing(listing, nights),
+      status: "pending_payment",
+      createdAt: new Date().toISOString(),
+      paymentId: null,
+      listingSnapshot: listing,
+      guestSnapshot: {
+        id: guestId,
+        name: guest.name || auth.currentUser.displayName || "",
+        avatar: guest.avatar || auth.currentUser.photoURL || "",
+        email: guest.email || auth.currentUser.email || "",
+        phone: guest.phone || "",
+        createdAt: guest.createdAt ? asISO(guest.createdAt) : null,
+      },
+      hostSnapshot: listing.hostSnapshot || null,
+    };
+    transaction.set(bookingRef, booking);
+    lockRefs.forEach((ref, index) =>
+      transaction.set(ref, {
+        listingId,
+        date: dates[index],
+        bookingId: bookingRef.id,
+      }),
+    );
+    return { id: bookingRef.id, ...booking };
+  });
 }
 
 export async function getBooking(id) {
-  await delay(100);
-  const b = getDb().bookings.find((x) => x.id === id);
-  return b ? clone(enrich(b)) : null;
+  const bookingSnap = await getDoc(doc(db, "bookings", id));
+  return bookingSnap.exists()
+    ? enrich({ id: bookingSnap.id, ...bookingSnap.data() })
+    : null;
 }
 
 export async function getGuestBookings(guestId) {
-  await delay();
-  return clone(
-    getDb()
-      .bookings.filter(
-        (b) => b.guestId === guestId && b.status !== "pending_payment",
-      )
-      .map(enrich)
-      .sort((a, b) => new Date(b.checkIn) - new Date(a.checkIn)),
+  const snapshot = await getDocs(
+    query(collection(db, "bookings"), where("guestId", "==", guestId)),
   );
+  const bookings = snapshot.docs
+    .map((bookingSnap) => ({ id: bookingSnap.id, ...bookingSnap.data() }))
+    .filter((booking) => booking.status !== "pending_payment");
+  const enriched = await Promise.all(bookings.map(enrich));
+  return enriched.sort((a, b) => new Date(b.checkIn) - new Date(a.checkIn));
 }
 
 export async function getHostBookings(hostId) {
-  await delay();
-  return clone(
-    getDb()
-      .bookings.filter(
-        (b) => b.hostId === hostId && b.status !== "pending_payment",
-      )
-      .map(enrich)
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+  const snapshot = await getDocs(
+    query(collection(db, "bookings"), where("hostId", "==", hostId)),
+  );
+  const bookings = snapshot.docs
+    .map((bookingSnap) => ({ id: bookingSnap.id, ...bookingSnap.data() }))
+    .filter((booking) => booking.status !== "pending_payment");
+  const enriched = await Promise.all(bookings.map(enrich));
+  return enriched.sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
   );
 }
 
 // How much the guest would get back if they cancelled right now (for the confirm dialog).
 export async function getCancellationPreview(bookingId) {
-  const b = getDb().bookings.find((x) => x.id === bookingId);
-  if (!b) throw new Error("Booking not found.");
-  const listing = getDb().listings.find((l) => l.id === b.listingId);
+  const bookingSnap = await getDoc(doc(db, "bookings", bookingId));
+  if (!bookingSnap.exists()) throw new Error("Booking not found.");
+  const b = { id: bookingSnap.id, ...bookingSnap.data() };
+  const listingSnap = b.listingSnapshot
+    ? null
+    : await getDoc(doc(db, "listings", b.listingId));
+  const listing =
+    b.listingSnapshot ??
+    (listingSnap?.exists() ? listingSnap.data() : null);
   return refundFor(b, withListingDefaults(listing), { byGuest: true });
 }
 
@@ -193,151 +288,171 @@ export async function getCancellationPreview(bookingId) {
 //   admin                         -> anything
 // ----------------------------------------------------------------------------
 export async function updateBookingStatus(id, status, actor) {
-  await delay();
-  const db = getDb();
-  const b = db.bookings.find((x) => x.id === id);
-  if (!b) throw new Error("Booking not found.");
   if (!actor) throw new Error("You must be logged in.");
+  if (!auth.currentUser || auth.currentUser.uid !== actor.id)
+    throw new Error("You must be logged in.");
 
-  const isAdmin = actor.role === "admin";
-  const isGuest = b.guestId === actor.id;
-  const isHost = b.hostId === actor.id;
-  if (!isAdmin && !isGuest && !isHost)
-    throw new Error("You are not allowed to change this reservation.");
+  const bookingRef = doc(db, "bookings", id);
+  const updatedBooking = await runTransaction(db, async (transaction) => {
+    const bookingSnap = await transaction.get(bookingRef);
+    if (!bookingSnap.exists()) throw new Error("Booking not found.");
+    const booking = { id: bookingSnap.id, ...bookingSnap.data() };
+    const isAdmin = actor.role === "admin";
+    const isGuest = booking.guestId === actor.id;
+    const isHost = booking.hostId === actor.id;
+    if (!isAdmin && !isGuest && !isHost)
+      throw new Error("You are not allowed to change this reservation.");
 
-  const from = b.status;
-  const can =
-    isAdmin ||
-    (isGuest &&
-      status === "cancelled" &&
-      ["pending", "confirmed"].includes(from)) ||
-    (isHost &&
-      ((status === "confirmed" && from === "pending") ||
-        (status === "cancelled" && ["pending", "confirmed"].includes(from)) ||
-        (status === "completed" && from === "confirmed")));
-  if (!can)
-    throw new Error(
-      `This reservation cannot be changed from "${from}" to "${status}".`,
-    );
-  if (status === "completed" && !isAdmin && b.checkIn > todayStr())
-    throw new Error("A stay can only be completed after check-in.");
+    const from = booking.status;
+    const can =
+      isAdmin ||
+      (isGuest &&
+        status === "cancelled" &&
+        ["pending", "confirmed"].includes(from)) ||
+      (isHost &&
+        ((status === "confirmed" && from === "pending") ||
+          (status === "cancelled" && ["pending", "confirmed"].includes(from)) ||
+          (status === "completed" && from === "confirmed")));
+    if (!can)
+      throw new Error(
+        `This reservation cannot be changed from "${from}" to "${status}".`,
+      );
+    if (status === "completed" && !isAdmin && booking.checkIn > todayStr())
+      throw new Error("A stay can only be completed after check-in.");
 
-  const listing = db.listings.find((l) => l.id === b.listingId);
-  const title = listing?.title || "your stay";
-  const guestName = db.users.find((u) => u.id === b.guestId)?.name || "A guest";
-
-  if (status === "cancelled") {
-    // cancelling frees the dates automatically (cancelled bookings are not "active"),
-    // and the payment is refunded according to the cancellation policy
-    const byGuest = isGuest && !isAdmin;
-    const refund = refundFor(b, withListingDefaults(listing), { byGuest });
-    b.cancelledAt = new Date().toISOString();
-    b.cancelledBy = isAdmin ? "admin" : isGuest ? "guest" : "host";
-    b.refundAmount = refund.amount;
-    const p = db.payments.find((x) => x.id === b.paymentId);
-    if (p && p.status === "succeeded" && refund.amount > 0) {
-      p.status = refund.amount >= p.amount ? "refunded" : "partially_refunded";
-      p.refundAmount = refund.amount;
-    }
-    if (byGuest) {
-      pushNotification(b.hostId, {
-        type: "booking",
-        title: "Reservation cancelled",
-        message: `${guestName} cancelled their stay at ${title}.`,
-        link: "/host/reservations",
+    const updated = { ...booking, status };
+    if (status === "cancelled") {
+      const listingRef = doc(db, "listings", booking.listingId);
+      const paymentRef = booking.paymentId
+        ? doc(db, "payments", booking.paymentId)
+        : null;
+      const listingSnap = booking.listingSnapshot
+        ? null
+        : await transaction.get(listingRef);
+      const paymentSnap = paymentRef
+        ? await transaction.get(paymentRef)
+        : null;
+      const listing =
+        booking.listingSnapshot ??
+        (listingSnap?.exists() ? listingSnap.data() : null);
+      const byGuest = isGuest && !isAdmin;
+      const refund = refundFor(booking, withListingDefaults(listing), {
+        byGuest,
       });
-      pushNotification(b.guestId, {
-        type: "booking",
-        title: "Cancellation confirmed",
-        message: `Your stay at ${title} was cancelled. Refund: $${refund.amount.toFixed(2)}.`,
-        link: `/booking/${b.id}/confirmation`,
+      updated.cancelledAt = new Date().toISOString();
+      updated.cancelledBy = isAdmin ? "admin" : isGuest ? "guest" : "host";
+      updated.refundAmount = refund.amount;
+
+      const dates = Array.from(
+        { length: nightsBetween(booking.checkIn, booking.checkOut) },
+        (_, index) => addDays(booking.checkIn, index),
+      );
+      const lockRefs = dates.map((date) =>
+        doc(db, "listings", booking.listingId, "availability", date),
+      );
+      const lockSnaps = await Promise.all(
+        lockRefs.map((ref) => transaction.get(ref)),
+      );
+      lockRefs.forEach((ref, index) => {
+        if (
+          lockSnaps[index].exists() &&
+          lockSnaps[index].data().bookingId === id
+        )
+          transaction.delete(ref);
       });
-    } else {
-      pushNotification(b.guestId, {
-        type: "booking",
-        title:
-          from === "pending" && isHost
-            ? "Request declined"
-            : "Reservation cancelled",
-        message: `Your stay at ${title} was cancelled by the ${b.cancelledBy}. You are refunded $${refund.amount.toFixed(2)}.`,
-        link: `/booking/${b.id}/confirmation`,
-      });
-      if (isAdmin)
-        pushNotification(b.hostId, {
-          type: "booking",
-          title: "Reservation cancelled by admin",
-          message: `${guestName}'s stay at ${title} was cancelled.`,
-          link: "/host/reservations",
+      if (
+        paymentRef &&
+        paymentSnap?.exists() &&
+        paymentSnap.data().status === "succeeded" &&
+        refund.amount > 0
+      ) {
+        transaction.update(paymentRef, {
+          status:
+            refund.amount >= paymentSnap.data().amount
+              ? "refunded"
+              : "partially_refunded",
+          refundAmount: refund.amount,
         });
+      }
     }
-  } else if (status === "confirmed") {
-    pushNotification(b.guestId, {
-      type: "booking",
-      title: "Request accepted",
-      message: `Your host accepted your stay at ${title}. See you on ${b.checkIn}!`,
-      link: `/booking/${b.id}/confirmation`,
-    });
-  } else if (status === "completed") {
-    pushNotification(b.guestId, {
-      type: "review",
-      title: "How was your stay?",
-      message: `Your stay at ${title} is complete. Tell others about it with a review.`,
-      link: "/trips",
-    });
-  }
 
-  b.status = status;
-  save();
-  return clone(enrich(b));
+    transaction.update(bookingRef, {
+      status: updated.status,
+      ...(updated.cancelledAt
+        ? {
+            cancelledAt: updated.cancelledAt,
+            cancelledBy: updated.cancelledBy,
+            refundAmount: updated.refundAmount,
+          }
+        : {}),
+    });
+    return updated;
+  });
+  return enrich(updatedBooking);
 }
 
 // ---- Host availability calendar -------------------------------------------------
 export async function getCalendarData(listingId, actor) {
-  await delay(120);
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === listingId);
-  if (!listing) throw new Error("Listing not found.");
+  const listingSnap = await getDoc(doc(db, "listings", listingId));
+  if (!listingSnap.exists()) throw new Error("Listing not found.");
+  const listing = { id: listingSnap.id, ...listingSnap.data() };
   if (listing.hostId !== actor?.id && actor?.role !== "admin")
     throw new Error("Not your listing.");
-  const bookings = db.bookings
-    .filter(
-      (b) =>
-        b.listingId === listingId &&
-        ACTIVE_STATUSES.includes(b.status) &&
-        b.status !== "pending_payment",
-    )
-    .map((b) => ({
-      id: b.id,
-      checkIn: b.checkIn,
-      checkOut: b.checkOut,
-      status: b.status,
-      guestName: db.users.find((u) => u.id === b.guestId)?.name,
+  const constraints =
+    actor?.role === "admin"
+      ? [where("listingId", "==", listingId)]
+      : [where("hostId", "==", actor?.id)];
+  const snapshot = await getDocs(
+    query(collection(db, "bookings"), ...constraints),
+  );
+  const bookings = snapshot.docs
+    .map((bookingSnap) => ({
+      id: bookingSnap.id,
+      ...bookingSnap.data(),
+    }))
+    .filter((booking) => booking.listingId === listingId)
+    .filter((booking) => ACTIVE_STATUSES.includes(booking.status))
+    .filter((booking) => booking.status !== "pending_payment")
+    .map((booking) => ({
+      id: booking.id,
+      checkIn: booking.checkIn,
+      checkOut: booking.checkOut,
+      status: booking.status,
+      guestName: booking.guestName ?? booking.guestSnapshot?.name,
     }));
-  return clone({ bookings, blockedDates: listing.blockedDates || [] });
+  return { bookings, blockedDates: listing.blockedDates || [] };
 }
 
 export async function setBlockedDates(listingId, dates, block, actor) {
-  await delay(120);
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === listingId);
-  if (!listing) throw new Error("Listing not found.");
-  if (listing.hostId !== actor?.id && actor?.role !== "admin")
-    throw new Error("Not your listing.");
-  const set = new Set(listing.blockedDates || []);
-  const booked = db.bookings.filter(
-    (b) =>
-      b.listingId === listingId && ["pending", "confirmed"].includes(b.status),
+  if (!actor) throw new Error("You must be logged in.");
+  if (!auth.currentUser || auth.currentUser.uid !== actor.id)
+    throw new Error("You must be logged in.");
+  const listingRef = doc(db, "listings", listingId);
+  const dateRefs = dates.map((date) =>
+    doc(db, "listings", listingId, "availability", date),
   );
-  for (const d of dates) {
-    if (block) {
-      if (d < todayStr()) continue;
-      if (booked.some((b) => d >= b.checkIn && d < b.checkOut)) continue; // can't block a reserved night
-      set.add(d);
-    } else set.delete(d);
-  }
-  listing.blockedDates = [...set].sort();
-  save();
-  return clone(listing.blockedDates);
+  return runTransaction(db, async (transaction) => {
+    const [listingSnap, ...dateSnaps] = await Promise.all([
+      transaction.get(listingRef),
+      ...dateRefs.map((ref) => transaction.get(ref)),
+    ]);
+    if (!listingSnap.exists()) throw new Error("Listing not found.");
+    const listing = listingSnap.data();
+    if (listing.hostId !== actor.id && actor.role !== "admin")
+      throw new Error("Not your listing.");
+    const blockedDates = new Set(listing.blockedDates || []);
+    dates.forEach((date, index) => {
+      if (block) {
+        if (date < todayStr() || dateSnaps[index].exists()) return;
+        blockedDates.add(date);
+      } else {
+        blockedDates.delete(date);
+      }
+    });
+    const result = [...blockedDates].sort();
+    transaction.update(listingRef, { blockedDates: result });
+    return result;
+  });
 }
 
 export { blockedToRanges };

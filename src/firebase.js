@@ -1,4 +1,4 @@
-// Firebase bootstrap. NOT imported anywhere yet — the backend dev imports { auth, db, storage } from the services.
+// Firebase bootstrap. Services import the configured Firebase clients from this module.
 // Copy .env.example to .env and fill in the values from Firebase console > Project settings.
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";

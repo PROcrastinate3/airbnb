@@ -36,6 +36,7 @@ export default function ListingDetail() {
   const {
     data: listing,
     loading,
+    error: listingError,
     reload,
   } = useAsync(() => getListing(id), [id]);
   const { data: blocked } = useAsync(() => getUnavailableRanges(id), [id]);
@@ -67,11 +68,19 @@ export default function ListingDetail() {
     return (
       <div className="container-page py-20">
         <EmptyState
-          title="Listing not found"
+          title={listingError ? "Unable to load listing" : "Listing not found"}
+          text={listingError?.message}
           action={
-            <Link to="/search" className="btn-primary">
-              Browse stays
-            </Link>
+            <div className="flex justify-center gap-3">
+              {listingError && (
+                <button onClick={reload} className="btn-secondary">
+                  Try again
+                </button>
+              )}
+              <Link to="/search" className="btn-primary">
+                Browse stays
+              </Link>
+            </div>
           }
         />
       </div>

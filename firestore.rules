@@ -1,11 +1,20 @@
-// STARTER rules — review before deploying. Client-side checks in the app are UX only.
-// Anything marked CLOUD FUNCTION must be done server-side (bookings, payments, notifications, role changes).
+// Spark-compatible rules for the client-managed demo booking flow.
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
-    function isAdmin()  { return signedIn() && request.auth.token.role == 'admin'; }
+    function roleOf() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function isAdmin()  { return signedIn() && roleOf() == 'admin'; }
+    function isHost()   { return signedIn() && roleOf() in ['host', 'admin']; }
     function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function bookingPath(id) {
+      return /databases/$(database)/documents/bookings/$(id);
+    }
+    function paymentPath(id) {
+      return /databases/$(database)/documents/payments/$(id);
+    }
 
     // Public: categories + service fee are needed before login.
     match /settings/{id} {
@@ -15,7 +24,7 @@ service cloud.firestore {
 
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
-      // Owner may edit profile fields only — NOT role / status / hostApplication.status (CLOUD FUNCTION / admin).
+      // Owners may edit profile fields, but not role, status, or application decisions.
       allow create: if isOwner(uid) && request.resource.data.role == 'guest';
       allow update: if isAdmin() ||
         (isOwner(uid) && !request.resource.data.diff(resource.data).affectedKeys()
@@ -25,44 +34,176 @@ service cloud.firestore {
       }
     }
 
+    match /hostApplication/{applicationId} {
+      allow read: if signedIn()
+        && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly([
+          'userId', 'status', 'businessName', 'about', 'note', 'submittedAt'
+        ]);
+      allow update, delete: if isAdmin();
+    }
+
+    match /availability/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /publicProfiles/{uid} {
+      allow read: if true;
+      allow create, update: if (isOwner(uid) || isAdmin())
+        && request.resource.data.keys().hasOnly([
+          'name', 'avatar', 'bio', 'createdAt'
+        ]);
+      allow delete: if isAdmin();
+    }
+
     match /listings/{id} {
       allow read: if resource.data.status == 'published'
                   || isOwner(resource.data.hostId) || isAdmin();
-      allow create: if signedIn() && request.auth.token.role == 'host'
+      allow create: if isHost()
                     && request.resource.data.hostId == request.auth.uid
-                    && request.resource.data.status == 'pending';
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.rating == 0
+                    && request.resource.data.reviewCount == 0;
       allow update: if isAdmin() || (isOwner(resource.data.hostId)
                     && request.resource.data.hostId == resource.data.hostId);
-      allow delete: if isAdmin() || isOwner(resource.data.hostId); // + "no active bookings" check => CLOUD FUNCTION
+      allow delete: if isAdmin() || isOwner(resource.data.hostId);
+
+      // These records expose availability only; bookingId is used to release a lock on cancellation.
+      match /availability/{date} {
+        allow read: if true;
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['listingId', 'date', 'bookingId'])
+          && request.resource.data.listingId == id
+          && request.resource.data.date == date
+          && getAfter(bookingPath(request.resource.data.bookingId)).data.guestId == request.auth.uid
+          && getAfter(bookingPath(request.resource.data.bookingId)).data.listingId == id
+          && date >= getAfter(bookingPath(request.resource.data.bookingId)).data.checkIn
+          && date < getAfter(bookingPath(request.resource.data.bookingId)).data.checkOut;
+        allow delete: if signedIn() && (
+          isAdmin()
+          || (
+            getAfter(bookingPath(resource.data.bookingId)).data.status == 'cancelled'
+            && (
+              get(bookingPath(resource.data.bookingId)).data.guestId == request.auth.uid
+              || get(bookingPath(resource.data.bookingId)).data.hostId == request.auth.uid
+            )
+          )
+        );
+      }
     }
 
-    // CLOUD FUNCTION writes: price calc, double-booking transaction, status transitions, refunds.
     match /bookings/{id} {
       allow read: if signedIn() && (resource.data.guestId == request.auth.uid
                   || resource.data.hostId == request.auth.uid || isAdmin());
-      allow write: if false;
+      allow create: if signedIn()
+        && request.resource.data.guestId == request.auth.uid
+        && request.resource.data.status == 'pending_payment'
+        && request.resource.data.paymentId == null
+        && get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.status == 'published'
+        && get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.hostId == request.resource.data.hostId
+        && request.resource.data.hostId != request.auth.uid
+        && request.resource.data.checkIn is string
+        && request.resource.data.checkOut is string
+        && request.resource.data.checkIn < request.resource.data.checkOut;
+      allow update: if signedIn() && (
+        isAdmin()
+        || (
+          resource.data.guestId == request.auth.uid
+          && resource.data.status in ['pending', 'confirmed']
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'cancelledAt', 'cancelledBy', 'refundAmount'])
+        )
+        || (
+          resource.data.hostId == request.auth.uid
+          && (
+            (resource.data.status == 'pending'
+              && request.resource.data.status == 'confirmed'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+            || (resource.data.status in ['pending', 'confirmed']
+              && request.resource.data.status == 'cancelled'
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'cancelledAt', 'cancelledBy', 'refundAmount']))
+            || (resource.data.status == 'confirmed'
+              && request.resource.data.status == 'completed'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+          )
+        )
+        || (
+          resource.data.guestId == request.auth.uid
+          && resource.data.status == 'pending_payment'
+          && request.resource.data.status in ['pending', 'confirmed']
+          && request.resource.data.paymentId is string
+          && getAfter(paymentPath(request.resource.data.paymentId)).data.bookingId == id
+          && getAfter(paymentPath(request.resource.data.paymentId)).data.guestId == request.auth.uid
+          && getAfter(paymentPath(request.resource.data.paymentId)).data.amount == resource.data.total
+          && getAfter(paymentPath(request.resource.data.paymentId)).data.status == 'succeeded'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'paymentId'])
+        )
+      );
+      allow delete: if false;
     }
-    // Availability for the booking widget: expose only {listingId, checkIn, checkOut} via a Function or a
-    // separate public 'availability' collection — guests must not read other people's bookings.
 
     match /payments/{id} {
       allow read: if signedIn() && (resource.data.guestId == request.auth.uid
                   || resource.data.hostId == request.auth.uid || isAdmin());
-      allow write: if false; // Stripe webhook only
+      allow create: if signedIn()
+        && request.resource.data.bookingId is string
+        && request.resource.data.guestId == request.auth.uid
+        && getAfter(bookingPath(request.resource.data.bookingId)).data.guestId == request.auth.uid
+        && getAfter(bookingPath(request.resource.data.bookingId)).data.paymentId == id
+        && getAfter(bookingPath(request.resource.data.bookingId)).data.status in ['pending', 'confirmed']
+        && request.resource.data.amount == getAfter(bookingPath(request.resource.data.bookingId)).data.total
+        && request.resource.data.status == 'succeeded';
+      allow update: if signedIn() && (
+        (isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'refundAmount'])
+          && request.resource.data.status in ['partially_refunded', 'refunded']
+          && request.resource.data.refundAmount <= resource.data.amount)
+        || (
+          (resource.data.guestId == request.auth.uid
+            || resource.data.hostId == request.auth.uid)
+          && getAfter(bookingPath(resource.data.bookingId)).data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'refundAmount'])
+          && request.resource.data.status in ['partially_refunded', 'refunded']
+          && request.resource.data.refundAmount <= resource.data.amount
+        )
+      );
+      allow delete: if false;
     }
 
     match /reviews/{id} {
       allow read: if resource.data.status == 'visible'
-                  || isOwner(resource.data.guestId) || isAdmin();
-      allow create: if signedIn() && request.resource.data.guestId == request.auth.uid; // eligibility => CLOUD FUNCTION
-      allow update, delete: if isAdmin();
+            || isOwner(resource.data.guestId) || isAdmin()
+            || isOwner(get(/databases/$(database)/documents/listings/$(resource.data.listingId)).data.hostId);
+      // Review eligibility is not enforced by these client-only rules.
+      allow create: if signedIn() && request.resource.data.guestId == request.auth.uid;
+      allow delete: if isAdmin();
+      allow update: if isAdmin()
+        || (signedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reported'])
+          && isOwner(get(/databases/$(database)/documents/listings/$(resource.data.listingId)).data.hostId)
+          && request.resource.data.reported.by == request.auth.uid
+          && request.resource.data.reported.reason is string
+          && request.resource.data.reported.reason.size() > 0
+          && request.resource.data.reported.keys().hasOnly(['by', 'reason', 'at']));
     }
 
     match /notifications/{id} {
       allow read, delete: if signedIn() && resource.data.userId == request.auth.uid;
       allow update: if signedIn() && resource.data.userId == request.auth.uid
                     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
-      allow create: if false; // CLOUD FUNCTION
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'userId', 'type', 'title', 'message', 'link', 'read', 'createdAt'
+        ])
+        && request.resource.data.read == false;
     }
   }
 }
