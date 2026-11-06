@@ -17,7 +17,7 @@ export default function Footer() {
           <ul className="space-y-2 text-gray-600">
             <li>
               <Link to="/become-a-host" className="hover:underline">
-                NAME? your home
+                StayBNB your home
               </Link>
             </li>
             <li>Hosting resources</li>
@@ -25,7 +25,7 @@ export default function Footer() {
           </ul>
         </div>
         <div>
-          <h4 className="mb-3 font-semibold">NAME?</h4>
+          <h4 className="mb-3 font-semibold">StayBNB</h4>
           <ul className="space-y-2 text-gray-600">
             <li>About us</li>
             <li>Careers</li>
@@ -34,7 +34,7 @@ export default function Footer() {
         </div>
       </div>
       <div className="border-t border-gray-200 py-5 text-center text-xs text-gray-500">
-        © {new Date().getFullYear()} NAME?, Inc. · A demo project — not
+        © {new Date().getFullYear()} StayBNB, Inc. · A demo project — not
         affiliated with Airbnb.
       </div>
     </footer>

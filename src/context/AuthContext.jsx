@@ -46,7 +46,7 @@ export function AuthProvider({ children }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await auth.signOut();
+    await auth.logout();
     setUser(null);
     setWishlist([]);
   }, []);

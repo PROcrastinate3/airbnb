@@ -2,7 +2,6 @@ import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext.jsx";
 import PasswordInput from "../components/PasswordInput.jsx";
-
 export default function Register() {
   const { register } = useAuth();
   const navigate = useNavigate();
@@ -25,6 +24,7 @@ export default function Register() {
       const u = await register(form);
       navigate(u.wantsHost ? "/become-a-host" : from || "/", { replace: true });
     } catch (err) {
+      console.error(err);
       setError(err.message);
     } finally {
       setBusy(false);
@@ -32,7 +32,6 @@ export default function Register() {
   };
 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
-
   return (
     <div className="container-page flex justify-center py-16">
       <div className="w-full max-w-md">

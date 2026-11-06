@@ -131,7 +131,7 @@ export default function Home() {
       <section className="container-page mt-20">
         <div className="grid items-center gap-8 overflow-hidden rounded-3xl bg-gray-900 text-white md:grid-cols-2">
           <div className="p-8 sm:p-12">
-            <h2 className="text-3xl font-bold">Try hosting on NAME?</h2>
+            <h2 className="text-3xl font-bold">Try hosting on StayBNB</h2>
             <p className="mt-3 text-white/80">
               Earn extra income and unlock new opportunities by sharing your
               space with travellers.

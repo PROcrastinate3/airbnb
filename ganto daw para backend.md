@@ -22,7 +22,10 @@ Dates are plain `YYYY-MM-DD` strings; timestamps are ISO strings. Convert Firest
 
 ## Functions to implement (signature = contract)
 
-**authService** `signIn(email,password)` · `signUp({name,email,password,role})` (role `host` only starts an application; user stays `guest`) · `signOut()` · `restoreSession()` → `onAuthStateChanged` · `updateProfile(userId,data)` · `applyAsHost(userId,{businessName,phone,about})` · `changePassword(userId,current,next)` · `getUser(id)`
+**authService** `signIn(email,password)` · `signUp({name,email,password,role})` (role `host` only starts an application; user stays `guest`) · `signOut()` · `restoreSession()` → `onAuthStateChanged` · `updateProfile(userId,data)` · 
+
+//todo
+`applyAsHost(userId,{businessName,phone,about})` · `changePassword(userId,current,next)` · `getUser(id)`
 
 **listingService** `getListings(filters)` (q, category, minPrice, maxPrice, guests, propertyType, sort, **checkIn/checkOut → exclude booked/blocked**) · `getListing(id)` (includes host + visible reviews) · `getHostListings(hostId)` · `createListing(hostId,data)` · `updateListing(id,data,actor)` · `deleteListing(id,actor)` · `getReviewEligibility(userId,listingId)` · `getReviewedListingIds(userId)` · `addReview({...})` · `getHostReviews(hostId)` · `reportReview(reviewId,reason,actor)` · wishlist: `getWishlistIds`, `getWishlist`, `toggleWishlist`
 

@@ -57,7 +57,7 @@ export default function BecomeHost() {
     <div className="container-page py-16">
       <div className="mx-auto max-w-3xl text-center">
         <h1 className="text-4xl font-extrabold sm:text-5xl">
-          It's easy to get started on NAME?
+          It's easy to get started on StayBNB
         </h1>
         <p className="mt-4 text-lg text-gray-600">
           Turn your spare room or second home into income.

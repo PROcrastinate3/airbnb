@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext.jsx";
 import NotificationBell from "./NotificationBell.jsx";
+import { signOut } from "firebase/auth";
 
 export default function Navbar() {
   const { user, isHost, isAdmin, logout } = useAuth();
@@ -20,7 +21,7 @@ export default function Navbar() {
           to="/"
           className="flex items-center gap-2 text-2xl font-extrabold tracking-tight text-brand-500"
         >
-          <span aria-hidden>⌂</span> NAME?
+          <span aria-hidden>⌂</span> StayBNB
         </Link>
 
         <nav className="hidden items-center gap-1 md:flex">
@@ -39,7 +40,7 @@ export default function Navbar() {
             )
           ) : (
             <NavLink to="/become-a-host" className="btn-ghost">
-              NAME? your home
+              StayBNB your home
             </NavLink>
           )}
         </nav>
@@ -121,8 +122,13 @@ export default function Navbar() {
                       <MenuItem
                         onClick={async () => {
                           setOpen(false);
-                          await logout();
-                          navigate("/");
+
+                          try {
+                            await logout();
+                            navigate("/", { replace: true });
+                          } catch (error) {
+                            console.error("Logout failed:", error);
+                          }
                         }}
                       >
                         Log out
@@ -138,7 +144,7 @@ export default function Navbar() {
                       </MenuItem>
                       <div className="my-1 border-t border-gray-100" />
                       <MenuItem onClick={() => go("/become-a-host")}>
-                        NAME your home
+                        StayBNB your home
                       </MenuItem>
                     </>
                   )}

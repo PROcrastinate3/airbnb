@@ -36,7 +36,7 @@ export default function DashboardLayout({ title, accent = "brand", links }) {
         to="/"
         className="mb-1 px-3 text-2xl font-extrabold tracking-tight text-brand-500"
       >
-        ⌂ NAME?
+        ⌂ StayBNB
       </Link>
       <p className="mb-6 px-3 text-xs font-semibold uppercase tracking-wide text-gray-400">
         {title}
@@ -63,7 +63,7 @@ export default function DashboardLayout({ title, accent = "brand", links }) {
           to="/"
           className="block rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100"
         >
-          ← Back to NAME?
+          ← Back to StayBNB
         </Link>
         <button
           onClick={async () => {

@@ -5,6 +5,7 @@
 //   create/update  -> addDoc / updateDoc ; images -> Firebase Storage uploadBytes + getDownloadURL
 //   ownership      -> enforce in Firestore rules: resource.data.hostId == request.auth.uid
 import { getDb, save, delay, genId, clone } from "./db.js";
+import { getAuth } from "firebase/auth";
 import { pushNotification, notifyAdmins } from "./notificationService.js";
 import {
   ACTIVE_STATUSES,
@@ -14,13 +15,36 @@ import {
   todayStr,
   withListingDefaults,
 } from "./rules.js";
-
+import {
+  collection,
+  query,
+  where,
+  getDocs,
+  addDoc,
+  deleteDoc,
+  doc,
+  setDoc,
+  serverTimestamp,
+  getDoc,
+  updateDoc,
+} from "firebase/firestore";
+import { auth, db } from "../firebase";
 const isAdminOrOwner = (listing, actor) =>
   !!actor && (actor.role === "admin" || listing.hostId === actor.id);
 
+// Nights of the stay: checkIn inclusive, checkOut exclusive ("YYYY-MM-DD")
+function nightsBetween(checkIn, checkOut) {
+  const nights = [];
+  const d = new Date(`${checkIn}T00:00:00Z`);
+  const end = new Date(`${checkOut}T00:00:00Z`);
+  while (d < end) {
+    nights.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return nights;
+}
+
 export async function getListings(filters = {}) {
-  await delay();
-  const db = getDb();
   const {
     q,
     category,
@@ -32,7 +56,28 @@ export async function getListings(filters = {}) {
     checkIn,
     checkOut,
   } = filters;
-  let list = db.listings.filter((l) => l.status === "published");
+
+  // Filters Firestore can handle server-side
+  const constraints = [where("status", "==", "published")];
+  if (category && category !== "all")
+    constraints.push(where("category", "==", category));
+  if (propertyType && propertyType !== "any")
+    constraints.push(where("propertyType", "==", propertyType));
+  if (minPrice)
+    constraints.push(where("pricePerNight", ">=", Number(minPrice)));
+  if (maxPrice)
+    constraints.push(where("pricePerNight", "<=", Number(maxPrice)));
+
+  const snapshot = await getDocs(
+    query(collection(db, "listings"), ...constraints),
+  );
+
+  let list = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+  // Guests: kept client-side to avoid a second range filter on another field
+  if (guests) list = list.filter((l) => (l.maxGuests ?? 0) >= Number(guests));
+
+  // Text search: Firestore has no substring search, so filter here
   if (q && q.trim()) {
     const s = q.trim().toLowerCase();
     list = list.filter((l) =>
@@ -49,41 +94,80 @@ export async function getListings(filters = {}) {
       ].some((f) => (f || "").toLowerCase().includes(s)),
     );
   }
-  if (category && category !== "all")
-    list = list.filter((l) => l.category === category);
-  if (minPrice) list = list.filter((l) => l.pricePerNight >= Number(minPrice));
-  if (maxPrice) list = list.filter((l) => l.pricePerNight <= Number(maxPrice));
-  if (guests) list = list.filter((l) => l.maxGuests >= Number(guests));
-  if (propertyType && propertyType !== "any")
-    list = list.filter((l) => l.propertyType === propertyType);
-  // date filter: hide listings that are booked or blocked during the chosen stay
-  if (checkIn && checkOut && checkOut > checkIn)
-    list = list.filter((l) => isRangeFree(db, l.id, checkIn, checkOut));
+
+  // Availability via the listing's blockedDates[]
+  if (checkIn && checkOut && checkOut > checkIn) {
+    const nights = nightsBetween(checkIn, checkOut);
+    list = list.filter((l) => {
+      const blocked = new Set(l.blockedDates ?? []);
+      return !nights.some((n) => blocked.has(n));
+    });
+    // TODO: also exclude listings with overlapping bookings once
+    // bookings are in Firestore (see note below)
+  }
+
   if (sort === "price-asc")
-    list = [...list].sort((a, b) => a.pricePerNight - b.pricePerNight);
+    list.sort((a, b) => a.pricePerNight - b.pricePerNight);
   if (sort === "price-desc")
-    list = [...list].sort((a, b) => b.pricePerNight - a.pricePerNight);
-  if (sort === "rating") list = [...list].sort((a, b) => b.rating - a.rating);
-  return clone(list.map(withListingDefaults));
+    list.sort((a, b) => b.pricePerNight - a.pricePerNight);
+  if (sort === "rating") list.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+
+  return list.map(withListingDefaults);
 }
 
+const toMillis = (v) =>
+  v?.toMillis ? v.toMillis() : v ? new Date(v).getTime() : 0;
+
+const pickUser = (u) =>
+  u ? { id: u.id, name: u.name, avatar: u.avatar } : null;
+
 export async function getListing(id) {
-  await delay();
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === id);
-  if (!listing) return null;
-  const host = db.users.find((u) => u.id === listing.hostId);
-  const reviews = db.reviews
-    .filter((r) => r.listingId === id && isVisible(r))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .map((r) => {
-      const g = db.users.find((u) => u.id === r.guestId);
-      return {
-        ...r,
-        guest: g ? { id: g.id, name: g.name, avatar: g.avatar } : null,
-      };
-    });
-  return clone({
+  const listingSnap = await getDoc(doc(db, "listings", id));
+  if (!listingSnap.exists()) return null;
+  const listing = { id: listingSnap.id, ...listingSnap.data() };
+
+  // Fetch the host and the listing's reviews in parallel
+  const [hostSnap, reviewsSnap] = await Promise.all([
+    listing.hostId ? getDoc(doc(db, "users", listing.hostId)) : null,
+    getDocs(
+      query(
+        collection(db, "reviews"),
+        where("listingId", "==", id),
+        where("status", "==", "visible"),
+      ),
+    ),
+  ]);
+
+  const host =
+    hostSnap && hostSnap.exists()
+      ? { id: hostSnap.id, ...hostSnap.data() }
+      : null;
+
+  // Visibility and sorting are done client-side (no composite index needed)
+  const visibleReviews = reviewsSnap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .filter(isVisible)
+    .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+
+  // Fetch each unique guest once, not once per review
+  const guestIds = [
+    ...new Set(visibleReviews.map((r) => r.guestId).filter(Boolean)),
+  ];
+  const guestSnaps = await Promise.all(
+    guestIds.map((gid) => getDoc(doc(db, "users", gid))),
+  );
+  const guestsById = new Map(
+    guestSnaps
+      .filter((s) => s.exists())
+      .map((s) => [s.id, { id: s.id, ...s.data() }]),
+  );
+
+  const reviews = visibleReviews.map((r) => ({
+    ...r,
+    guest: pickUser(guestsById.get(r.guestId)),
+  }));
+
+  return {
     ...withListingDefaults(listing),
     host: host
       ? {
@@ -95,16 +179,18 @@ export async function getListing(id) {
         }
       : null,
     reviews,
-  });
+  };
 }
 
 export async function getHostListings(hostId) {
-  await delay();
-  return clone(
-    getDb()
-      .listings.filter((l) => l.hostId === hostId)
-      .map(withListingDefaults),
+  const snapshot = await getDocs(
+    query(collection(db, "listings"), where("hostId", "==", hostId)),
   );
+
+  return snapshot.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt)) // newest first
+    .map(withListingDefaults);
 }
 
 const numeric = (d, listing = {}) => ({
@@ -115,16 +201,20 @@ const numeric = (d, listing = {}) => ({
   beds: Number(d.beds ?? listing.beds),
   baths: Number(d.baths ?? listing.baths),
 });
-
 const cleanRules = (rules) =>
   Array.isArray(rules) ? rules.map((r) => r.trim()).filter(Boolean) : undefined;
+const stripUndefined = (obj) =>
+  Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 
 export async function createListing(hostId, data) {
-  await delay();
-  const db = getDb();
-  const host = db.users.find((u) => u.id === hostId);
+  const hostSnap = await getDoc(doc(db, "users", hostId));
+  const host = hostSnap.exists()
+    ? { id: hostSnap.id, ...hostSnap.data() }
+    : null;
   if (!host || !["host", "admin"].includes(host.role))
     throw new Error("Only approved hosts can create listings.");
+
+  // Strip fields the client must not control
   const {
     id: _i,
     hostId: _h,
@@ -132,38 +222,58 @@ export async function createListing(hostId, data) {
     reviewCount: _rc,
     status: _s,
     blockedDates: _b,
+    createdAt: _c,
     ...rest
   } = data;
-  const listing = withListingDefaults({
-    ...rest,
-    id: genId("l"),
+
+  const rules = cleanRules(data.houseRules);
+
+  const listing = stripUndefined({
+    ...withListingDefaults({
+      ...rest,
+      ...numeric(data),
+      ...(rules ? { houseRules: rules } : {}),
+    }),
     hostId,
     rating: 0,
     reviewCount: 0,
     status: "pending", // admin approves before publishing
-    createdAt: new Date().toISOString(),
-    ...numeric(data),
-    ...(cleanRules(data.houseRules)
-      ? { houseRules: cleanRules(data.houseRules) }
-      : {}),
+    blockedDates: [],
+    createdAt: serverTimestamp(),
   });
-  db.listings.unshift(listing);
-  notifyAdmins({
-    title: "Listing waiting for approval",
-    message: `${host.name} submitted "${listing.title}".`,
-    link: "/admin/listings",
-  });
-  save();
-  return clone(listing);
+  delete listing.id; // the id is the document ID, not a field
+
+  const token = await getAuth().currentUser.getIdTokenResult(true);
+  console.log("uid:", getAuth().currentUser.uid, "hostId:", hostId);
+  console.log("claims:", token.claims);
+  const ref = await addDoc(collection(db, "listings"), listing);
+
+  // Don't fail the whole creation if the notification fails
+  try {
+    await notifyAdmins({
+      title: "Listing waiting for approval",
+      message: `${host.name} submitted "${listing.title}".`,
+      link: "/admin/listings",
+    });
+  } catch (err) {
+    console.error("Failed to notify admins:", err);
+  }
+
+  // Re-read so createdAt is the resolved server timestamp, not a sentinel
+  const saved = await getDoc(ref);
+  return { id: saved.id, ...saved.data() };
 }
 
 export async function updateListing(id, data, actor) {
-  await delay();
-  const listing = getDb().listings.find((l) => l.id === id);
-  if (!listing) throw new Error("Listing not found.");
+  const ref = doc(db, "listings", id);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) throw new Error("Listing not found.");
+  const listing = { id: snap.id, ...snap.data() };
+
   // property ownership: a host can only change their own listings
   if (!isAdminOrOwner(listing, actor))
     throw new Error("You can only edit your own listings.");
+
   const {
     id: _i,
     hostId: _h,
@@ -174,57 +284,86 @@ export async function updateListing(id, data, actor) {
     status,
     ...rest
   } = data;
-  Object.assign(listing, rest, numeric(data, listing));
-  if (data.houseRules) listing.houseRules = cleanRules(data.houseRules);
+
+  // Collect changes instead of mutating the listing
+  const updates = {
+    ...rest,
+    ...numeric(data, listing), // falls back to the stored values
+    ...(data.houseRules ? { houseRules: cleanRules(data.houseRules) } : {}),
+  };
+
+  let relistRequested = false;
   if (status && status !== listing.status) {
     const hostMove =
       (listing.status === "published" && status === "unlisted") ||
       (listing.status === "unlisted" && status === "pending");
     if (actor.role === "admin" || hostMove) {
-      listing.status = status;
-      if (status === "pending")
-        notifyAdmins({
-          title: "Relist request",
-          message: `"${listing.title}" is waiting for approval.`,
-          link: "/admin/listings",
-        });
+      updates.status = status;
+      relistRequested = status === "pending";
     }
   }
-  save();
-  return clone(withListingDefaults(listing));
+
+  await updateDoc(ref, {
+    ...stripUndefined(updates),
+    updatedAt: serverTimestamp(),
+  });
+
+  if (relistRequested) {
+    try {
+      await notifyAdmins({
+        title: "Relist request",
+        message: `"${listing.title}" is waiting for approval.`,
+        link: "/admin/listings",
+      });
+    } catch (err) {
+      console.error("Failed to notify admins:", err);
+    }
+  }
+
+  const updated = await getDoc(ref);
+  return withListingDefaults({ id: updated.id, ...updated.data() });
 }
 
-// Deleting is blocked while there are pending / upcoming reservations.
 export async function deleteListing(id, actor) {
-  await delay();
-  const db = getDb();
-  const listing = db.listings.find((l) => l.id === id);
-  if (!listing) throw new Error("Listing not found.");
+  const ref = doc(db, "listings", id);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) throw new Error("Listing not found.");
+  const listing = { id: snap.id, ...snap.data() };
+
   if (!isAdminOrOwner(listing, actor))
     throw new Error("You can only delete your own listings.");
-  const blocking = db.bookings.filter(
-    (b) =>
-      b.listingId === id &&
-      ACTIVE_STATUSES.includes(b.status) &&
-      b.checkOut >= todayStr(),
+
+  // The hostId filter is required: your rules only let a host read bookings
+  // where hostId == their uid, so a query without it is rejected outright.
+  const bookingsSnap = await getDocs(
+    query(
+      collection(db, "bookings"),
+      where("listingId", "==", id),
+      where("hostId", "==", listing.hostId),
+      where("status", "in", ACTIVE_STATUSES),
+    ),
   );
+  const today = todayStr();
+  const blocking = bookingsSnap.docs.filter((d) => d.data().checkOut >= today);
   if (blocking.length)
     throw new Error(
       `This listing has ${blocking.length} pending or upcoming reservation(s). Cancel them first, or unlist the property instead.`,
     );
-  db.listings = db.listings.filter((l) => l.id !== id);
-  db.reviews = db.reviews.filter((r) => r.listingId !== id);
-  Object.keys(db.wishlists).forEach((u) => {
-    db.wishlists[u] = db.wishlists[u].filter((x) => x !== id);
-  });
-  if (actor.role === "admin" && listing.hostId !== actor.id)
-    pushNotification(listing.hostId, {
-      type: "listing",
-      title: "Listing removed",
-      message: `"${listing.title}" was removed by an administrator.`,
-      link: "/host/listings",
-    });
-  save();
+
+  await deleteDoc(ref);
+
+  if (actor.role === "admin" && listing.hostId !== actor.id) {
+    try {
+      await pushNotification(listing.hostId, {
+        type: "listing",
+        title: "Listing removed",
+        message: `"${listing.title}" was removed by an administrator.`,
+        link: "/host/listings",
+      });
+    } catch (err) {
+      console.error("Failed to notify host:", err);
+    }
+  }
 }
 
 // ---- Reviews -----------------------------------------------------------------
