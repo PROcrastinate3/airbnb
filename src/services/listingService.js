@@ -369,36 +369,54 @@ export async function deleteListing(id, actor) {
 // ---- Reviews -----------------------------------------------------------------
 // Review eligibility: the guest must have a COMPLETED stay at this listing
 // (or a confirmed stay whose check-out date has passed) and may review it only once.
-export function reviewEligibility(db, userId, listingId) {
+export async function reviewEligibility(userId, listingId) {
   if (!userId) return { eligible: false, reason: "login" };
-  const stay = db.bookings
-    .filter((b) => b.listingId === listingId && b.guestId === userId)
+
+  // Both queries filter by guestId, which your read rules require
+  const bookingsSnap = await getDocs(
+    query(
+      collection(db, "bookings"),
+      where("guestId", "==", userId),
+      where("listingId", "==", listingId),
+    ),
+  );
+  const today = todayStr();
+  const stay = bookingsSnap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
     .find(
       (b) =>
         b.status === "completed" ||
-        (b.status === "confirmed" && b.checkOut < todayStr()),
+        (b.status === "confirmed" && b.checkOut < today),
     );
   if (!stay) return { eligible: false, reason: "no-stay" };
-  if (db.reviews.some((r) => r.listingId === listingId && r.guestId === userId))
-    return { eligible: false, reason: "already" };
+
+  const existing = await getDocs(
+    query(
+      collection(db, "reviews"),
+      where("guestId", "==", userId),
+      where("listingId", "==", listingId),
+      limit(1),
+    ),
+  );
+  if (!existing.empty) return { eligible: false, reason: "already" };
+
   return { eligible: true, bookingId: stay.id };
 }
 
 export async function getReviewEligibility(userId, listingId) {
-  await delay(60);
-  return reviewEligibility(getDb(), userId, listingId);
+  return reviewEligibility(userId, listingId);
 }
 
 export async function getReviewedListingIds(userId) {
-  return getDb()
-    .reviews.filter((r) => r.guestId === userId)
-    .map((r) => r.listingId);
+  if (!userId) return [];
+  const snap = await getDocs(
+    query(collection(db, "reviews"), where("guestId", "==", userId)),
+  );
+  return snap.docs.map((d) => d.data().listingId);
 }
 
 export async function addReview({ listingId, guestId, rating, comment }) {
-  await delay();
-  const db = getDb();
-  const el = reviewEligibility(db, guestId, listingId);
+  const el = await reviewEligibility(guestId, listingId);
   if (!el.eligible)
     throw new Error(
       el.reason === "already"
@@ -408,49 +426,77 @@ export async function addReview({ listingId, guestId, rating, comment }) {
   const r = Number(rating);
   if (!(r >= 1 && r <= 5)) throw new Error("Choose a rating from 1 to 5.");
   if (!comment?.trim()) throw new Error("Please write a short review.");
-  const review = {
-    id: genId("r"),
-    listingId,
-    guestId,
-    bookingId: el.bookingId,
-    rating: r,
-    comment: comment.trim(),
-    status: "visible",
-    createdAt: new Date().toISOString(),
-  };
-  db.reviews.unshift(review);
-  const listing = db.listings.find((l) => l.id === listingId);
-  if (listing) {
-    applyReviewDelta(listing, r, +1);
-    const guest = db.users.find((u) => u.id === guestId);
-    pushNotification(listing.hostId, {
-      type: "review",
-      title: "New review",
-      message: `${guest?.name || "A guest"} rated "${listing.title}" ${r}★.`,
-      link: "/host/reviews",
+
+  // Deterministic ID: one review per guest per listing, enforced by the rules
+  const ref = doc(db, "reviews", `${guestId}_${listingId}`);
+  try {
+    await setDoc(ref, {
+      listingId,
+      guestId,
+      bookingId: el.bookingId,
+      rating: r,
+      comment: comment.trim(),
+      status: "visible",
+      createdAt: serverTimestamp(),
     });
+  } catch (err) {
+    if (err.code === "permission-denied")
+      throw new Error(
+        "Couldn't submit your review. You may have already reviewed this stay.",
+      );
+    throw err;
   }
-  save();
-  return clone(review);
+
+  const saved = await getDoc(ref);
+  return { id: saved.id, ...saved.data() };
 }
 
 // Host review management: every review on the host's listings + per-listing ratings.
+// Public name/avatar lookup. A failed or missing lookup gives null, as in the mock.
+async function getPublicProfiles(ids) {
+  const entries = await Promise.all(
+    ids.map(async (uid) => {
+      try {
+        const snap = await getDoc(doc(db, "publicProfiles", uid));
+        if (!snap.exists()) return null;
+        const { name, avatar } = snap.data();
+        return [uid, { id: uid, name, avatar }];
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return new Map(entries.filter(Boolean));
+}
+
 export async function getHostReviews(hostId) {
-  await delay();
-  const db = getDb();
-  const mine = db.listings.filter((l) => l.hostId === hostId);
-  const ids = new Set(mine.map((l) => l.id));
-  const reviews = db.reviews
-    .filter((r) => ids.has(r.listingId))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .map((r) => {
-      const g = db.users.find((u) => u.id === r.guestId);
-      return {
-        ...r,
-        guest: g ? { id: g.id, name: g.name, avatar: g.avatar } : null,
-        listingTitle: mine.find((l) => l.id === r.listingId)?.title,
-      };
-    });
+  const listingsSnap = await getDocs(
+    query(collection(db, "listings"), where("hostId", "==", hostId)),
+  );
+  const mine = listingsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+  // One query per listing: the rule looks up each listing's host, which only
+  // works when the query pins listingId to a single value
+  const reviewSnaps = await Promise.all(
+    mine.map((l) =>
+      getDocs(query(collection(db, "reviews"), where("listingId", "==", l.id))),
+    ),
+  );
+  const all = reviewSnaps
+    .flatMap((s) => s.docs.map((d) => ({ id: d.id, ...d.data() })))
+    .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+
+  const guests = await getPublicProfiles([
+    ...new Set(all.map((r) => r.guestId).filter(Boolean)),
+  ]);
+  const titleById = new Map(mine.map((l) => [l.id, l.title]));
+
+  const reviews = all.map((r) => ({
+    ...r,
+    guest: guests.get(r.guestId) ?? null,
+    listingTitle: titleById.get(r.listingId),
+  }));
+
   const summary = mine.map((l) => ({
     id: l.id,
     title: l.title,
@@ -458,54 +504,64 @@ export async function getHostReviews(hostId) {
     count: l.reviewCount,
     shown: reviews.filter((r) => r.listingId === l.id && isVisible(r)).length,
   }));
-  return clone({ reviews, summary });
+
+  return { reviews, summary };
 }
 
 // A host can report an abusive review; admins decide in Review moderation.
 export async function reportReview(reviewId, reason, actor) {
-  await delay();
-  const db = getDb();
-  const r = db.reviews.find((x) => x.id === reviewId);
-  if (!r) throw new Error("Review not found.");
-  const listing = db.listings.find((l) => l.id === r.listingId);
-  if (!listing || listing.hostId !== actor?.id)
+  const reviewRef = doc(db, "reviews", reviewId);
+  const reviewSnap = await getDoc(reviewRef);
+  if (!reviewSnap.exists()) throw new Error("Review not found.");
+  const r = { id: reviewSnap.id, ...reviewSnap.data() };
+
+  const listingSnap = await getDoc(doc(db, "listings", r.listingId));
+  if (!listingSnap.exists() || listingSnap.data().hostId !== actor?.id)
     throw new Error("You can only report reviews on your own listings.");
   if (!reason?.trim())
     throw new Error("Tell us why you are reporting this review.");
-  r.reported = {
-    by: actor.id,
-    reason: reason.trim(),
-    at: new Date().toISOString(),
-  };
-  notifyAdmins({
-    title: "Review reported",
-    message: `A host reported a review on "${listing.title}".`,
-    link: "/admin/reviews",
+
+  await updateDoc(reviewRef, {
+    reported: {
+      by: actor.id,
+      reason: reason.trim(),
+      at: serverTimestamp(),
+    },
   });
-  save();
 }
 
 // ---- Wishlist --------------------------------------------------------------
 // FIREBASE: /users/{uid}/wishlist/{listingId} subcollection
 export async function getWishlistIds(userId) {
-  return clone(getDb().wishlists[userId] || []);
+  if (!userId) return [];
+  const snap = await getDocs(collection(db, "users", userId, "wishlist"));
+  return snap.docs.map((d) => d.data().listingId ?? d.id);
 }
 
 export async function getWishlist(userId) {
-  await delay();
-  const db = getDb();
-  const ids = db.wishlists[userId] || [];
-  return clone(
-    db.listings.filter((l) => ids.includes(l.id)).map(withListingDefaults),
+  const ids = await getWishlistIds(userId);
+
+  // One getDoc per listing. A listing that was deleted or is no longer
+  // readable (unlisted, suspended) throws a permission error, so skip it
+  const snaps = await Promise.all(
+    ids.map(async (id) => {
+      try {
+        return await getDoc(doc(db, "listings", id));
+      } catch {
+        return null;
+      }
+    }),
   );
+
+  return snaps
+    .filter((s) => s && s.exists())
+    .map((s) => withListingDefaults({ id: s.id, ...s.data() }));
 }
 
 export async function toggleWishlist(userId, listingId) {
-  const db = getDb();
-  const ids = db.wishlists[userId] || [];
-  db.wishlists[userId] = ids.includes(listingId)
-    ? ids.filter((i) => i !== listingId)
-    : [...ids, listingId];
-  save();
-  return clone(db.wishlists[userId]);
+  const ref = doc(db, "users", userId, "wishlist", listingId);
+  const snap = await getDoc(ref);
+  if (snap.exists()) await deleteDoc(ref);
+  else await setDoc(ref, { listingId });
+  return getWishlistIds(userId);
 }
